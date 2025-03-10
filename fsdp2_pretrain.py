@@ -1,7 +1,8 @@
 # Author: Yuanjun "Dastin" Huang
 # FSDP2 pretraining for qwen2.5_0.5B on fineweb-edu
-# Last updated on 03/08/2025 (MM/DD/YYYY)
+# Last updated on 03/09/2025 (MM/DD/YYYY)
 
+import torch.distributed.checkpoint as dcp
 import torch.distributed as dist
 import torch.distributed
 import torch.optim as optim
@@ -10,16 +11,15 @@ import torch.utils
 import torch.utils.checkpoint
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer, AutoConfig
 from copy import deepcopy
 from tqdm import tqdm
-import contextlib
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 from LARC import LARC
 import numpy as np
 from torcheval.metrics.functional.text import perplexity
-from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM, Qwen2DecoderLayer
+from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from torch.distributed.fsdp import (
     fully_shard,
     MixedPrecisionPolicy,
@@ -27,6 +27,8 @@ from torch.distributed.fsdp import (
 import argparse
 import torch
 import os
+import shutil
+from dcp_util import AppState
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 torch.manual_seed(42)
 # from bitsandbytes.optim import LARS
@@ -88,6 +90,11 @@ class Trainer:
         self.step_cnt = 0
         self.top_k_list = []
 
+        if save_dir is not None:
+            save_dir = 'model_checkpoints/{}'.format(save_dir)
+            os.makedirs(save_dir, exist_ok=True)
+        self.save_dir = save_dir
+
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         dist.init_process_group("nccl")
         self.rank = dist.get_rank()
@@ -109,25 +116,20 @@ class Trainer:
         if self.rank == 0:
             print('train: {}, val {}'.format(
                 len(self.train_dataset), len(self.val_dataset)))
-            self.log_dir = 'runs/{}'.format(log_dir)
+            log_dir = 'runs/{}'.format(log_dir)
             self.writer = SummaryWriter(log_dir=log_dir)
-            if save_dir is not None:
-                os.makedirs(save_dir, exist_ok=True)
-            self.save_dir = save_dir
 
-        self._init_model()
-        self.optimizer = optim.AdamW(self.fsdp_model.parameters(),
-                                     lr=MAX_LR, weight_decay=0.1)
+        self._init_model_and_optimizer()
         self.lr_scheduler = LambdaLR(self.optimizer, lr_scheduler_fn)
 
-    def _init_model(self):
+    def _init_model_and_optimizer(self):
         config = AutoConfig.from_pretrained(MODEL_NAME)
         config.vocab_size = 50258
         config.bos_token_id = 50256
         config.eos_token_id = 50256
         config.use_cache = False
 
-        model = Qwen2ForCausalLM(config).to('cuda')
+        model = Qwen2ForCausalLM(config)
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
 
@@ -140,19 +142,15 @@ class Trainer:
             reshard_after_forward=True,
             mp_policy=mp_policy,
         )
+        # torch.distributed.checkpoint.state_dict_loader.load(self.fsdp_model.state_dict(
+        # ), checkpoint_id='model_checkpoints/qwen_7B/0_1_11.01')
+        self.optimizer = optim.AdamW(self.fsdp_model.parameters(),
+                                     lr=MAX_LR, weight_decay=0.1)
         self.fsdp_model.train()
 
-    def save_model(self, path):
-        state_dict = self.fsdp_model.state_dict()
-        all_state_dicts = [None] * torch.distributed.get_world_size()
-        dist.gather_object(
-            state_dict, all_state_dicts if self.rank == 0 else None, dst=0)
-
-        if self.rank == 0:
-            aggregated_state_dict = {}
-            for sd in all_state_dicts:
-                aggregated_state_dict.update(sd)
-            torch.save(aggregated_state_dict, path)
+    def save_checkpoint(self, path):
+        torch.distributed.checkpoint.state_dict_saver.save(
+            self.fsdp_model.state_dict(), checkpoint_id=path)
 
     def validate(self, val_dataloader):
         torch.cuda.empty_cache()
@@ -175,13 +173,15 @@ class Trainer:
                                       [:, :-1, :], y[:, 1:], ignore_index=-100)
                 batch_cnt += 1
 
-        dist.reduce(val_loss, 0, op=dist.ReduceOp.SUM)
-        dist.reduce(val_ppl, 0, op=dist.ReduceOp.SUM)
-        dist.reduce(batch_cnt, 0, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_ppl, op=dist.ReduceOp.SUM)
+        dist.all_reduce(batch_cnt, op=dist.ReduceOp.SUM)
         val_loss /= batch_cnt
         val_ppl /= batch_cnt
         self.fsdp_model.train()
         torch.cuda.empty_cache()
+        if self.rank == 0:
+            print('Validation loss calculated: {}'.format(val_loss))
         return val_loss, val_ppl
 
     def train_on_dataloader(self, train_sampler, train_dataloader, val_dataloader, grad_accu_step):
@@ -226,53 +226,6 @@ class Trainer:
                         [x.grad for x in self.fsdp_model.parameters()])
 
                     self.step_cnt += 1
-                    if self.step_cnt % self.save_frequency == 0:
-                        val_loss = 0
-                        val_loss, val_ppl = self.validate(val_dataloader)
-
-                        if self.rank == 0:
-                            self.writer.add_scalars(
-                                'perplexity', {'val': val_ppl}, self.step_cnt)
-                            self.writer.add_scalars(
-                                'loss', {'val': val_loss}, self.step_cnt)
-
-                            if self.save_dir is not None:
-
-                                if len(self.top_k_list) == self.save_top_k and self.top_k_list[-1]['loss'] < val_loss:
-                                    # no need to save
-                                    pass
-                                else:
-                                    save_path = os.path.join(
-                                        self.save_dir, '{}_{}_{:.2f}.pt'.format(epoch, self.step_cnt, val_loss))
-                                    if len(self.top_k_list) == self.save_top_k:
-                                        try:
-                                            os.remove(
-                                                self.top_k_list[-1]['path'])
-                                        except:
-                                            pass
-                                        self.top_k_list.pop(-1)
-
-                                    self.top_k_list.append({
-                                        'path': save_path,
-                                        'loss': loss,
-                                    })
-                                    self.top_k_list = sorted(
-                                        self.top_k_list, key=lambda x: x['loss'])
-
-                                    try:
-                                        self.save_model(save_path)
-                                        # to_save = {
-                                        #     'step': self.step_cnt,
-                                        #     'weight': all_state_dicts,
-                                        #     'optimizer_state': optimizer.state_dict(),
-                                        #     'lr_state': lr_scheduler.state_dict(),
-                                        # }
-                                        print(
-                                            'model saved at {}'.format(save_path))
-                                    except:
-                                        print(
-                                            'model failed to be saved at {}'.format(save_path))
-
                     if self.rank == 0:
                         self.writer.add_scalars(
                             'grad_norm', {
@@ -296,6 +249,46 @@ class Trainer:
                                    }
 
                         progress.set_postfix(postfix)
+
+                    if self.step_cnt % self.save_frequency == 0:
+                        val_loss = 0
+                        val_loss, val_ppl = self.validate(val_dataloader)
+
+                        if self.save_dir is not None:
+                            if len(self.top_k_list) == self.save_top_k and self.top_k_list[-1]['loss'] < val_loss:
+                                # no need to save
+                                pass
+                            else:
+                                save_path = os.path.join(
+                                    self.save_dir, '{}_{}_{:.2f}'.format(epoch, self.step_cnt, val_loss))
+                                if self.rank == 0:
+                                    if len(self.top_k_list) > 0:
+                                        ckpt_path_to_remove = self.top_k_list[-1]['path']
+                                        if len(self.top_k_list) == self.save_top_k:
+                                            if os.path.isfile(ckpt_path_to_remove):
+                                                os.remove(ckpt_path_to_remove)
+                                            elif os.path.isdir(ckpt_path_to_remove):
+                                                shutil.rmtree(
+                                                    ckpt_path_to_remove)
+                                            else:
+                                                pass
+                                            self.top_k_list.pop(-1)
+
+                                    self.top_k_list.append({
+                                        'path': save_path,
+                                        'loss': loss,
+                                    })
+                                    self.top_k_list = sorted(
+                                        self.top_k_list, key=lambda x: x['loss'])
+                                print('rank {} saving model'.format(self.rank))
+                                self.save_checkpoint(save_path)
+                                print('rank {} done saving model'.format(self.rank))
+
+                        if self.rank == 0:
+                            self.writer.add_scalars(
+                                'perplexity', {'val': val_ppl}, self.step_cnt)
+                            self.writer.add_scalars(
+                                'loss', {'val': val_loss}, self.step_cnt)
 
                 if self.rank == 0:
                     progress.update(1)
