@@ -1,7 +1,8 @@
 # Author: Yuanjun "Dastin" Huang
 # FSDP2 pretraining for qwen2.5_0.5B on fineweb-edu
-# Last updated on 03/09/2025 (MM/DD/YYYY)
+# Last updated on 03/13/2025 (MM/DD/YYYY)
 
+from torchdata.stateful_dataloader.stateful_dataloader import StatefulDataLoader
 import torch.distributed.checkpoint as dcp
 import torch.distributed as dist
 import torch.distributed
@@ -16,7 +17,7 @@ from copy import deepcopy
 from tqdm import tqdm
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
-from LARC import LARC
+# from LARC import LARC
 import numpy as np
 from torcheval.metrics.functional.text import perplexity
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
@@ -28,9 +29,9 @@ import argparse
 import torch
 import os
 import shutil
-from dcp_util import AppState
+# from dcp_util import AppState
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-torch.manual_seed(42)
+
 # from bitsandbytes.optim import LARS
 
 DEBUG_STREAMING = False
@@ -83,12 +84,13 @@ class CollateFn:
 
 
 class Trainer:
-    def __init__(self, save_frequency=1000, clip_grad_max_norm=1, save_dir=None, log_dir='', save_top_k=2):
+    def __init__(self, save_frequency=1000, clip_grad_max_norm=1, save_dir=None, log_dir='', save_top_k=2, previous_ckpt_step=0, load_from_ckpt=None):
         self.save_frequency = save_frequency
         self.clip_grad_max_norm = clip_grad_max_norm
         self.save_top_k = save_top_k
         self.step_cnt = 0
         self.top_k_list = []
+        self.previous_ckpt_step = previous_ckpt_step
 
         if save_dir is not None:
             save_dir = 'model_checkpoints/{}'.format(save_dir)
@@ -98,11 +100,15 @@ class Trainer:
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         dist.init_process_group("nccl")
         self.rank = dist.get_rank()
+        if self.rank != 0:
+            from datasets.utils.logging import disable_progress_bar
+            disable_progress_bar()
 
         self.train_dataset = load_dataset(
             HF_DATA_PATH,
             name=HF_DATA_SUBSET_NAME,
             split=HF_DATA_SPLIT+'[:98%]',
+            # split=HF_DATA_SPLIT,
             streaming=DEBUG_STREAMING,
         )
         self.val_dataset = load_dataset(
@@ -110,6 +116,7 @@ class Trainer:
             name=HF_DATA_SUBSET_NAME,
             split=HF_DATA_SPLIT+'[-2%:]',
             # split=HF_DATA_SPLIT+'[-5000:]',
+            # split=HF_DATA_SPLIT,
             streaming=DEBUG_STREAMING,
         )
 
@@ -120,7 +127,13 @@ class Trainer:
             self.writer = SummaryWriter(log_dir=log_dir)
 
         self._init_model_and_optimizer()
-        self.lr_scheduler = LambdaLR(self.optimizer, lr_scheduler_fn)
+        if load_from_ckpt is not None:
+            torch.distributed.checkpoint.state_dict_loader.load(self.fsdp_model.state_dict(
+            ), checkpoint_id=os.path.join(load_from_ckpt, 'weight'))
+            torch.distributed.checkpoint.state_dict_loader.load(self.optimizer.state_dict(
+            ), checkpoint_id=os.path.join(load_from_ckpt, 'optim'))
+        self.lr_scheduler = LambdaLR(
+            self.optimizer, lr_scheduler_fn, last_epoch=previous_ckpt_step)
 
     def _init_model_and_optimizer(self):
         config = AutoConfig.from_pretrained(MODEL_NAME)
@@ -142,15 +155,20 @@ class Trainer:
             reshard_after_forward=True,
             mp_policy=mp_policy,
         )
-        # torch.distributed.checkpoint.state_dict_loader.load(self.fsdp_model.state_dict(
-        # ), checkpoint_id='model_checkpoints/qwen_7B/0_1_11.01')
+
         self.optimizer = optim.AdamW(self.fsdp_model.parameters(),
                                      lr=MAX_LR, weight_decay=0.1)
         self.fsdp_model.train()
 
     def save_checkpoint(self, path):
+        torch.cuda.empty_cache()
         torch.distributed.checkpoint.state_dict_saver.save(
-            self.fsdp_model.state_dict(), checkpoint_id=path)
+            self.fsdp_model.state_dict(), checkpoint_id=os.path.join(path, 'weight'))
+        torch.distributed.checkpoint.state_dict_saver.save(
+            self.optimizer.state_dict(), checkpoint_id=os.path.join(path, 'optim'))
+        torch.distributed.checkpoint.state_dict_saver.save(
+            self.train_dataloader.state_dict(), checkpoint_id=os.path.join(path, 'dataloader'))
+        torch.cuda.empty_cache()
 
     def validate(self, val_dataloader):
         torch.cuda.empty_cache()
@@ -184,16 +202,20 @@ class Trainer:
             print('Validation loss calculated: {}'.format(val_loss))
         return val_loss, val_ppl
 
-    def train_on_dataloader(self, train_sampler, train_dataloader, val_dataloader, grad_accu_step):
+    def train_on_dataloader(self, train_sampler, grad_accu_step):
         if self.rank == 0:
-            progress = tqdm(enumerate(train_dataloader),
-                            total=len(train_dataloader)//grad_accu_step)
+            progress = tqdm(enumerate(self.train_dataloader),
+                            total=len(self.train_dataloader)//grad_accu_step)
         else:
-            progress = enumerate(train_dataloader)
+            progress = enumerate(self.train_dataloader)
 
         for epoch in range(1):
             train_sampler.set_epoch(epoch)
             for i, data in progress:
+                if self.step_cnt < self.previous_ckpt_step:
+                    if i % grad_accu_step == grad_accu_step - 1:
+                        self.step_cnt += 1
+                    continue
                 x, y = data
                 if i % grad_accu_step == 0:
                     mini_batch_loss = 0
@@ -252,7 +274,7 @@ class Trainer:
 
                     if self.step_cnt % self.save_frequency == 0:
                         val_loss = 0
-                        val_loss, val_ppl = self.validate(val_dataloader)
+                        val_loss, val_ppl = self.validate(self.val_dataloader)
 
                         if self.save_dir is not None:
                             if len(self.top_k_list) == self.save_top_k and self.top_k_list[-1]['loss'] < val_loss:
@@ -280,9 +302,9 @@ class Trainer:
                                     })
                                     self.top_k_list = sorted(
                                         self.top_k_list, key=lambda x: x['loss'])
-                                print('rank {} saving model'.format(self.rank))
                                 self.save_checkpoint(save_path)
-                                print('rank {} done saving model'.format(self.rank))
+                                if self.rank == 0:
+                                    print('model saved to {}'.format(save_path))
 
                         if self.rank == 0:
                             self.writer.add_scalars(
@@ -315,13 +337,19 @@ class Trainer:
             collate_fn_generator.max_length = high
             collate_fn = collate_fn_generator.collate_fn
             train_sampler = DistributedSampler(current_train_dataset)
-            train_dataloader = DataLoader(current_train_dataset, shuffle=False,
-                                          sampler=train_sampler, collate_fn=collate_fn, batch_size=batch_size, num_workers=1)
+            # train_dataloader = DataLoader(current_train_dataset, shuffle=False,
+            #                               sampler=train_sampler, collate_fn=collate_fn, batch_size=batch_size, num_workers=1)
+            self.train_dataloader = StatefulDataLoader(current_train_dataset, shuffle=False,
+                                                       sampler=train_sampler, collate_fn=collate_fn, batch_size=batch_size, num_workers=4)
+            # torch.distributed.checkpoint.state_dict_loader.load(self.train_dataloader.state_dict(
+            # ), checkpoint_id='model_checkpoints/qwen_7E/0_1_11.01/dataloader')
             val_sampler = DistributedSampler(current_val_dataset)
-            val_dataloader = DataLoader(current_val_dataset, shuffle=False,
-                                        sampler=val_sampler, collate_fn=collate_fn, batch_size=batch_size, num_workers=1)
+            # val_dataloader = DataLoader(current_val_dataset, shuffle=False,
+            #                             sampler=val_sampler, collate_fn=collate_fn, batch_size=batch_size, num_workers=1)
+            self.val_dataloader = StatefulDataLoader(current_val_dataset, shuffle=False,
+                                                     sampler=val_sampler, collate_fn=collate_fn, batch_size=batch_size, num_workers=2)
             self.train_on_dataloader(
-                train_sampler, train_dataloader, val_dataloader, grad_acc_step)
+                train_sampler, grad_acc_step)
 
         dist.destroy_process_group()
 
@@ -338,7 +366,12 @@ if __name__ == "__main__":
     parser.add_argument('--clip_grad_max_norm', default=1, type=float)
     parser.add_argument('--save_dir', default=None, type=str)
     parser.add_argument('--log_dir', default='test', type=str)
+    parser.add_argument('--seed', default=163, type=int)
+    parser.add_argument('--previous_ckpt_step', default=0, type=int)
+    parser.add_argument('--load_from_ckpt', default=None, type=str)
+
     args = parser.parse_args()
+    torch.manual_seed(args.seed)
 
     main(
         save_frequency=args.save_frequency,
@@ -346,4 +379,6 @@ if __name__ == "__main__":
         log_dir=args.log_dir,
         save_top_k=args.save_top_k,
         clip_grad_max_norm=args.clip_grad_max_norm,
+        previous_ckpt_step=args.previous_ckpt_step,
+        load_from_ckpt=args.load_from_ckpt,
     )
