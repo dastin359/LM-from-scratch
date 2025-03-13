@@ -133,7 +133,8 @@ class Trainer:
             torch.distributed.checkpoint.state_dict_loader.load(self.optimizer.state_dict(
             ), checkpoint_id=os.path.join(load_from_ckpt, 'optim'))
         self.lr_scheduler = LambdaLR(
-            self.optimizer, lr_scheduler_fn, last_epoch=previous_ckpt_step)
+            self.optimizer, lr_scheduler_fn)
+        self.lr_scheduler.last_epoch = previous_ckpt_step
 
     def _init_model_and_optimizer(self):
         config = AutoConfig.from_pretrained(MODEL_NAME)
