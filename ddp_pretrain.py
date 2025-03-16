@@ -1,9 +1,8 @@
 # Author: Yuanjun "Dastin" Huang
-# FSDP2 pretraining for qwen2.5_0.5B on fineweb-edu
+# DDP pretraining for qwen2.5_0.5B on fineweb-edu
 # Last updated on 03/15/2025 (MM/DD/YYYY)
 
 from torchdata.stateful_dataloader.stateful_dataloader import StatefulDataLoader
-import torch.distributed.checkpoint as dcp
 import torch.distributed as dist
 import torch.distributed
 import torch.optim as optim
@@ -21,18 +20,13 @@ from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from torcheval.metrics.functional.text import perplexity
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
-from torch.distributed.fsdp import (
-    fully_shard,
-    MixedPrecisionPolicy,
-)
+from torch.nn.parallel import DistributedDataParallel as DDP
 import argparse
 import torch
 import os
 import shutil
-import math
-# from dcp_util import AppState
+import contextlib
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-
 # from bitsandbytes.optim import LARS
 
 DEBUG_STREAMING = False
@@ -46,8 +40,6 @@ MAX_LR = 5e-4
 MIN_LR = 5e-5
 WARMUP_STEP = 2000
 MAX_STEP = 100000
-# number of token in a batch per GPU assuming a 4-GPU setup
-MAX_BATCH_TOKEN_CNT = 500000 // 4
 
 
 def lr_scheduler_fn(x):
@@ -127,12 +119,8 @@ class Trainer:
             log_dir = 'runs/{}'.format(log_dir)
             self.writer = SummaryWriter(log_dir=log_dir)
 
-        self._init_model_and_optimizer()
-        if load_from_ckpt is not None:
-            torch.distributed.checkpoint.state_dict_loader.load(self.fsdp_model.state_dict(
-            ), checkpoint_id=os.path.join(load_from_ckpt, 'model'))
-            torch.distributed.checkpoint.state_dict_loader.load(self.optimizer.state_dict(
-            ), checkpoint_id=os.path.join(load_from_ckpt, 'optim'))
+        self._init_model_and_optimizer(load_from_ckpt)
+
         self.lr_scheduler = LambdaLR(
             self.optimizer, lr_scheduler_fn)
         self.lr_scheduler.last_epoch = previous_ckpt_step
@@ -140,56 +128,54 @@ class Trainer:
         self.model_state_ckpt_future = None
         self.optim_state_ckpt_future = None
 
-    def _init_model_and_optimizer(self):
+    def _init_model_and_optimizer(self, load_from_ckpt):
         config = AutoConfig.from_pretrained(MODEL_NAME)
         config.vocab_size = 50258
         config.bos_token_id = 50256
         config.eos_token_id = 50256
         config.use_cache = False
 
-        model = Qwen2ForCausalLM(config)
+        model = Qwen2ForCausalLM(config).to('cuda')
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
 
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-        )
-        self.fsdp_model = fully_shard(
-            model,
-            reshard_after_forward=True,
-            mp_policy=mp_policy,
-        )
-
-        self.optimizer = optim.AdamW(self.fsdp_model.parameters(),
+        self.ddp_model = DDP(model, device_ids=[self.rank])
+        self.optimizer = optim.AdamW(self.ddp_model.parameters(),
                                      lr=MAX_LR, weight_decay=0.1)
-        self.fsdp_model.train()
+
+        if load_from_ckpt is not None and self.rank == 0:
+            # torch.distributed.checkpoint.state_dict_loader.load(self.ddp_model.state_dict(
+            # ), checkpoint_id=os.path.join(load_from_ckpt, 'model'))
+            # torch.distributed.checkpoint.state_dict_loader.load(self.optimizer.state_dict(
+            # ), checkpoint_id=os.path.join(load_from_ckpt, 'optim'))
+            self.ddp_model.load_state_dict(torch.load(
+                os.path.join(load_from_ckpt, 'model.pt'), weights_only=True))
+            self.optimizer.load_state_dict(torch.load(
+                os.path.join(load_from_ckpt, 'optim.pt'), weights_only=True))
+
+        self.ddp_model.train()
 
     def save_checkpoint(self, path):
-        # waits for checkpointing to finish if one exists, avoiding queuing more then one checkpoint request at a time
-        if self.model_state_ckpt_future is not None:
-            self.model_state_ckpt_future.result()
-        if self.optim_state_ckpt_future is not None:
-            self.optim_state_ckpt_future.result()
-        try:
-            torch.cuda.empty_cache()
-            self.model_state_ckpt_future = torch.distributed.checkpoint.state_dict_saver.async_save(
-                self.fsdp_model.state_dict(), checkpoint_id=os.path.join(path, 'model'))
-        except Exception as e:
-            print('failed to save model state on rank {}\n{}'.format(self.rank, e))
-        try:
-            torch.cuda.empty_cache()
-            self.optim_state_ckpt_future = torch.distributed.checkpoint.state_dict_saver.async_save(
-                self.optimizer.state_dict(), checkpoint_id=os.path.join(path, 'optim'))
-        except Exception as e:
-            print('failed to save optimizer state on rank {}\n{}'.format(self.rank, e))
-        # torch.distributed.checkpoint.state_dict_saver.save(
-        #     self.train_dataloader.state_dict(), checkpoint_id=os.path.join(path, 'dataloader'))
-        torch.cuda.empty_cache()
+        if self.rank == 0:
+            os.makedirs(path)
+            try:
+                torch.save(self.ddp_model.state_dict(),
+                           os.path.join(path, 'model.pt'))
+            except Exception as e:
+                print('failed to save model state on rank {}\n{}'.format(
+                    self.rank, e))
+
+            try:
+                torch.save(self.optimizer.state_dict(),
+                           os.path.join(path, 'optim.pt'))
+            except Exception as e:
+                print('failed to save optimizer state on rank {}\n{}'.format(
+                    self.rank, e))
+        dist.barrier()
 
     def validate(self, val_dataloader):
         torch.cuda.empty_cache()
-        self.fsdp_model.eval()
+        self.ddp_model.eval()
         with torch.no_grad():
             val_loss = 0
             val_ppl = 0
@@ -202,7 +188,7 @@ class Trainer:
                 progress = val_iter
             for data in progress:
                 x, y = data
-                pred = self.fsdp_model(**x.to('cuda'), labels=y.to('cuda'))
+                pred = self.ddp_model(**x.to('cuda'), labels=y.to('cuda'))
                 val_loss += pred['loss']
                 val_ppl += perplexity(pred['logits']
                                       [:, :-1, :], y[:, 1:], ignore_index=-100)
@@ -213,7 +199,7 @@ class Trainer:
         dist.all_reduce(batch_cnt, op=dist.ReduceOp.SUM)
         val_loss /= batch_cnt
         val_ppl /= batch_cnt
-        self.fsdp_model.train()
+        self.ddp_model.train()
         torch.cuda.empty_cache()
         if self.rank == 0:
             print('Validation loss calculated: {}'.format(val_loss))
@@ -239,9 +225,14 @@ class Trainer:
                     mini_batch_ppl = 0
                     self.optimizer.zero_grad(set_to_none=True)
 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    pred = self.fsdp_model(
-                        **x.to('cuda'), labels=y.to('cuda'))
+                if i % grad_accu_step == grad_accu_step - 1:
+                    sync_context = contextlib.nullcontext()
+                else:
+                    sync_context = self.ddp_model.no_sync()
+                with sync_context:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        pred = self.ddp_model(
+                            **x.to('cuda'), labels=y.to('cuda'))
 
                 loss = pred['loss'] / grad_accu_step
                 loss.backward()
@@ -252,9 +243,9 @@ class Trainer:
                 if i % grad_accu_step == grad_accu_step - 1:
                     mini_batch_ppl /= grad_accu_step
                     param_norm = torch.nn.utils.get_total_norm(
-                        self.fsdp_model.parameters())
+                        self.ddp_model.parameters())
                     grad_norm_pre_optimization = torch.nn.utils.clip_grad_norm_(
-                        self.fsdp_model.parameters(), self.clip_grad_max_norm)
+                        self.ddp_model.parameters(), self.clip_grad_max_norm)
 
                     dist.reduce(mini_batch_loss, 0, op=dist.ReduceOp.AVG)
                     dist.reduce(mini_batch_ppl, 0, op=dist.ReduceOp.AVG)
@@ -262,15 +253,15 @@ class Trainer:
                     self.lr_scheduler.step()
                     self.optimizer.step()
                     grad_norm_post_optimization = torch.nn.utils.get_total_norm(
-                        [x.grad for x in self.fsdp_model.parameters()])
+                        [x.grad for x in self.ddp_model.parameters()])
 
                     self.step_cnt += 1
                     if self.rank == 0:
                         self.writer.add_scalars(
                             'grad_norm', {
-                                'param': param_norm.to_local(),
-                                'pre_opt_step': grad_norm_pre_optimization.to_local(),
-                                'post_opt_step': grad_norm_post_optimization.to_local()
+                                'param': param_norm,
+                                'pre_opt_step': grad_norm_pre_optimization,
+                                'post_opt_step': grad_norm_post_optimization
                             },
                             self.step_cnt)
                         self.writer.add_scalars(
@@ -334,10 +325,9 @@ class Trainer:
 
     def train(self):
         max_len_steps = [0, 256, 512, 768, 1024, 1536, 2048, 8192]
-        batch_size_steps = [84, 42, 28, 21, 14, 11, 2]
-        grad_acc_steps = [1, 2, 3, 4, 6, 8, 42]
+        batch_size_steps = [56, 28, 19, 14, 9, 7, 1]
+        grad_acc_steps = [2, 4, 6, 8, 12, 16, 112]
         collate_fn_generator = CollateFn(TOKENIZER_NAME)
-        total_steps_cnt_after_this_dataloader = 0
 
         for low, high, batch_size, grad_acc_step in zip(max_len_steps[:-1], max_len_steps[1:], batch_size_steps, grad_acc_steps):
             if self.rank == 0:
@@ -360,16 +350,8 @@ class Trainer:
             val_sampler = DistributedSampler(current_val_dataset)
             self.val_dataloader = StatefulDataLoader(current_val_dataset, shuffle=False,
                                                      sampler=val_sampler, collate_fn=collate_fn, batch_size=batch_size, num_workers=2)
-
-            steps_in_current_train_loader = math.ceil(
-                len(self.train_dataloader) / grad_acc_step)
-            total_steps_cnt_after_this_dataloader += steps_in_current_train_loader
-            if self.previous_ckpt_step > total_steps_cnt_after_this_dataloader:
-                self.step_cnt += steps_in_current_train_loader
-                continue
-            else:
-                self.train_on_dataloader(
-                    train_sampler, grad_acc_step)
+            self.train_on_dataloader(
+                train_sampler, grad_acc_step)
 
         dist.destroy_process_group()
 
