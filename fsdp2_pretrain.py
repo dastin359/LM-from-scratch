@@ -1,6 +1,6 @@
 # Author: Yuanjun "Dastin" Huang
 # FSDP2 pretraining for qwen2.5_0.5B on fineweb-edu
-# Last updated on 03/15/2025 (MM/DD/YYYY)
+# Last updated on 03/17/2025 (MM/DD/YYYY)
 
 from torchdata.stateful_dataloader.stateful_dataloader import StatefulDataLoader
 import torch.distributed.checkpoint as dcp
@@ -30,6 +30,8 @@ import torch
 import os
 import shutil
 import math
+import datetime
+
 # from dcp_util import AppState
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -99,7 +101,10 @@ class Trainer:
         self.save_dir = save_dir
 
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        dist.init_process_group("cpu:gloo,cuda:nccl")
+        dist.init_process_group(
+            "cpu:gloo,cuda:nccl",
+            # timeout=datetime.timedelta(seconds=5400)
+        )
         self.rank = dist.get_rank()
         if self.rank != 0:
             from datasets.utils.logging import disable_progress_bar
@@ -167,25 +172,31 @@ class Trainer:
 
     def save_checkpoint(self, path):
         # waits for checkpointing to finish if one exists, avoiding queuing more then one checkpoint request at a time
-        if self.model_state_ckpt_future is not None:
-            self.model_state_ckpt_future.result()
-        if self.optim_state_ckpt_future is not None:
-            self.optim_state_ckpt_future.result()
+        # if self.model_state_ckpt_future is not None:
+        #     self.model_state_ckpt_future.result()
+        # if self.optim_state_ckpt_future is not None:
+        #     self.optim_state_ckpt_future.result()
+        dist.barrier()
         try:
-            torch.cuda.empty_cache()
-            self.model_state_ckpt_future = torch.distributed.checkpoint.state_dict_saver.async_save(
+            # torch.cuda.empty_cache()
+            # self.model_state_ckpt_future = torch.distributed.checkpoint.state_dict_saver.async_save(
+            #     self.fsdp_model.state_dict(), checkpoint_id=os.path.join(path, 'model'))
+            torch.distributed.checkpoint.state_dict_saver.save(
                 self.fsdp_model.state_dict(), checkpoint_id=os.path.join(path, 'model'))
         except Exception as e:
             print('failed to save model state on rank {}\n{}'.format(self.rank, e))
+        dist.barrier()
         try:
-            torch.cuda.empty_cache()
-            self.optim_state_ckpt_future = torch.distributed.checkpoint.state_dict_saver.async_save(
+            # torch.cuda.empty_cache()
+            # self.optim_state_ckpt_future = torch.distributed.checkpoint.state_dict_saver.async_save(
+            #     self.optimizer.state_dict(), checkpoint_id=os.path.join(path, 'optim'))
+            torch.distributed.checkpoint.state_dict_saver.save(
                 self.optimizer.state_dict(), checkpoint_id=os.path.join(path, 'optim'))
         except Exception as e:
             print('failed to save optimizer state on rank {}\n{}'.format(self.rank, e))
         # torch.distributed.checkpoint.state_dict_saver.save(
         #     self.train_dataloader.state_dict(), checkpoint_id=os.path.join(path, 'dataloader'))
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
     def validate(self, val_dataloader):
         torch.cuda.empty_cache()
@@ -208,6 +219,7 @@ class Trainer:
                                       [:, :-1, :], y[:, 1:], ignore_index=-100)
                 batch_cnt += 1
 
+        dist.barrier()
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_ppl, op=dist.ReduceOp.SUM)
         dist.all_reduce(batch_cnt, op=dist.ReduceOp.SUM)
@@ -256,6 +268,7 @@ class Trainer:
                     grad_norm_pre_optimization = torch.nn.utils.clip_grad_norm_(
                         self.fsdp_model.parameters(), self.clip_grad_max_norm)
 
+                    dist.barrier()
                     dist.reduce(mini_batch_loss, 0, op=dist.ReduceOp.AVG)
                     dist.reduce(mini_batch_ppl, 0, op=dist.ReduceOp.AVG)
 

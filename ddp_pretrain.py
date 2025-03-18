@@ -1,6 +1,6 @@
 # Author: Yuanjun "Dastin" Huang
 # DDP pretraining for qwen2.5_0.5B on fineweb-edu
-# Last updated on 03/15/2025 (MM/DD/YYYY)
+# Last updated on 03/17/2025 (MM/DD/YYYY)
 
 from torchdata.stateful_dataloader.stateful_dataloader import StatefulDataLoader
 import torch.distributed as dist
@@ -107,8 +107,8 @@ class Trainer:
         self.val_dataset = load_dataset(
             HF_DATA_PATH,
             name=HF_DATA_SUBSET_NAME,
-            split=HF_DATA_SPLIT+'[-2%:]',
-            # split=HF_DATA_SPLIT+'[-5000:]',
+            # split=HF_DATA_SPLIT+'[-2%:]',
+            split=HF_DATA_SPLIT+'[-5000:]',
             # split=HF_DATA_SPLIT,
             streaming=DEBUG_STREAMING,
         )
@@ -157,7 +157,7 @@ class Trainer:
 
     def save_checkpoint(self, path):
         if self.rank == 0:
-            os.makedirs(path)
+            os.makedirs(path, exist_ok=True)
             try:
                 torch.save(self.ddp_model.state_dict(),
                            os.path.join(path, 'model.pt'))
@@ -171,7 +171,8 @@ class Trainer:
             except Exception as e:
                 print('failed to save optimizer state on rank {}\n{}'.format(
                     self.rank, e))
-        dist.barrier()
+        # using barrier could cause DDP hang
+        # dist.barrier()
 
     def validate(self, val_dataloader):
         torch.cuda.empty_cache()
@@ -194,6 +195,7 @@ class Trainer:
                                       [:, :-1, :], y[:, 1:], ignore_index=-100)
                 batch_cnt += 1
 
+        # dist.barrier()
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_ppl, op=dist.ReduceOp.SUM)
         dist.all_reduce(batch_cnt, op=dist.ReduceOp.SUM)
@@ -234,8 +236,8 @@ class Trainer:
                         pred = self.ddp_model(
                             **x.to('cuda'), labels=y.to('cuda'))
 
-                loss = pred['loss'] / grad_accu_step
-                loss.backward()
+                    loss = pred['loss'] / grad_accu_step
+                    loss.backward()
                 mini_batch_loss += loss.detach()
                 mini_batch_ppl += perplexity(pred['logits']
                                              [:, :-1, :], y[:, 1:], ignore_index=-100)
