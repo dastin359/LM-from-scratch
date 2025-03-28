@@ -1,6 +1,6 @@
 # Author: Yuanjun "Dastin" Huang
 # FSDP1 pretraining for qwen2.5_0.5B on fineweb-edu
-# Last updated on 03/26/2025 (MM/DD/YYYY)
+# Last updated on 03/28/2025 (MM/DD/YYYY)
 
 from torchdata.stateful_dataloader.stateful_dataloader import StatefulDataLoader
 import torch.distributed.checkpoint as dcp
@@ -25,8 +25,6 @@ from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
     ShardingStrategy,
-    StateDictType,
-    FullStateDictConfig
 )
 import argparse
 import torch
@@ -34,9 +32,9 @@ import os
 import shutil
 import math
 import datetime
+from app_state import AppState
 # from dcp_util import AppState
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-
 # from bitsandbytes.optim import LARS
 
 DEBUG_STREAMING = False
@@ -88,27 +86,20 @@ class CollateFn:
 
 def is_sharded_fsdp_ckpt(path):
     try:
-        assert os.path.exists(path) and os.path.exists(os.path.join(
-            path, 'model')) and os.path.exists(os.path.join(path, 'optim'))
-        assert os.path.exists(os.path.join(path, 'model', '.metadata')) and os.path.exists(
-            os.path.join(path, 'optim', '.metadata'))
+        assert os.path.exists(path)
+
+        assert os.path.exists(os.path.join(path, '.metadata'))
         for i in range(int(os.environ["WORLD_SIZE"])):
             assert os.path.exists(os.path.join(
-                path, 'model', '__{}_0.distcp'.format(str(i))))
-            assert os.path.exists(os.path.join(
-                path, 'optim', '__{}_0.distcp'.format(str(i))))
+                path, '__{}_0.distcp'.format(str(i))))
         return True
     except:
         return False
 
 
 class Trainer:
-    def __init__(self, save_frequency=1000, validate_frequency=None, clip_grad_max_norm=1, save_dir=None, log_dir='', save_top_k=2, load_from_ckpt=None):
+    def __init__(self, save_frequency=1000, clip_grad_max_norm=1, save_dir=None, log_dir='', save_top_k=2, load_from_ckpt=None):
         self.save_frequency = save_frequency
-        if validate_frequency is None:
-            self.validate_frequency = save_frequency
-        else:
-            self.validate_frequency = validate_frequency
         self.clip_grad_max_norm = clip_grad_max_norm
         self.save_top_k = save_top_k
         self.step_cnt = 0
@@ -152,31 +143,38 @@ class Trainer:
             self.writer = SummaryWriter(log_dir=log_dir)
 
         self._init_model_and_optimizer()
-
         if load_from_ckpt is not None:
             if is_sharded_fsdp_ckpt(load_from_ckpt):
-                torch.distributed.checkpoint.state_dict_loader.load(self.fsdp_model.state_dict(
-                ), checkpoint_id=os.path.join(load_from_ckpt, 'model'))
-                torch.distributed.checkpoint.state_dict_loader.load(self.optimizer.state_dict(
-                ), checkpoint_id=os.path.join(load_from_ckpt, 'optim'))
+                state_dict = {"app": AppState(self.fsdp_model, self.optimizer)}
+                dcp.load(
+                    state_dict=state_dict,
+                    checkpoint_id=load_from_ckpt,
+                )
+                self.previous_ckpt_step = int(
+                    load_from_ckpt.split('_')[-2])
             else:
                 # find checkpoint
                 loaded_ckpt_flag = False
                 dirs = os.listdir(load_from_ckpt)
-                dirs = sorted(dirs, reverse=True)
-                for dir in dirs:
+                steps = [int(x.split('_')[-2]) for x in dirs]
+                dirs_with_steps = list(zip(dirs, steps))
+                dirs_with_steps = sorted(
+                    dirs_with_steps, reverse=True, key=lambda x: x[1])
+                for dir, step in dirs_with_steps:
                     full_dir = os.path.join(load_from_ckpt, dir)
                     if is_sharded_fsdp_ckpt(full_dir):
                         try:
-                            torch.distributed.checkpoint.state_dict_loader.load(self.fsdp_model.state_dict(
-                            ), checkpoint_id=os.path.join(full_dir, 'model'))
-                            torch.distributed.checkpoint.state_dict_loader.load(self.optimizer.state_dict(
-                            ), checkpoint_id=os.path.join(full_dir, 'optim'))
+                            state_dict = {"app": AppState(
+                                self.fsdp_model, self.optimizer)}
+                            dcp.load(
+                                state_dict=state_dict,
+                                checkpoint_id=full_dir,
+                            )
+
                             loaded_ckpt_flag = True
                             if self.rank == 0:
                                 print('loaded checkpoint from {}'.format(full_dir))
-                            self.previous_ckpt_step = int(
-                                full_dir.split('_')[-2])
+                            self.previous_ckpt_step = step
                             break
                         except:
                             continue
@@ -184,6 +182,8 @@ class Trainer:
                     self.previous_ckpt_step = 0
         else:
             self.previous_ckpt_step = 0
+
+        dist.barrier()
 
         self.lr_scheduler = LambdaLR(
             self.optimizer, lr_scheduler_fn)
@@ -218,46 +218,15 @@ class Trainer:
                                      lr=MAX_LR, weight_decay=0.1)
         self.fsdp_model.train()
 
-    def save_checkpoint(self, path, method='shard_state_dict'):
+    def save_checkpoint(self, path):
         # waits for checkpointing to finish if one exists, avoiding queuing more then one checkpoint request at a time
         # if self.model_state_ckpt_future is not None:
         #     self.model_state_ckpt_future.result()
         # if self.optim_state_ckpt_future is not None:
         #     self.optim_state_ckpt_future.result()
         dist.barrier()
-        if method == 'full_state_dict':
-            save_policy = FullStateDictConfig(
-                offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, save_policy):
-                state_dict = self.fsdp_model.state_dict()
-
-            if self.rank == 0:
-                try:
-                    os.makedirs(path, exist_ok=True)
-                    torch.save(state_dict, os.path.join(path, 'model.pt'))
-                except Exception as e:
-                    print('failed to save model state on rank {}\n{}'.format(
-                        self.rank, e))
-            dist.barrier()
-        elif method == 'shard_state_dict':
-            try:
-                # torch.cuda.empty_cache()
-                # self.model_state_ckpt_future = torch.distributed.checkpoint.state_dict_saver.async_save(
-                #     self.fsdp_model.state_dict(), checkpoint_id=os.path.join(path, 'model'))
-                torch.distributed.checkpoint.state_dict_saver.save(
-                    self.fsdp_model.state_dict(), checkpoint_id=os.path.join(path, 'model'))
-            except Exception as e:
-                print('failed to save model state on rank {}\n{}'.format(self.rank, e))
-            # dist.barrier()
-            try:
-                # torch.cuda.empty_cache()
-                # self.optim_state_ckpt_future = torch.distributed.checkpoint.state_dict_saver.async_save(
-                #     self.optimizer.state_dict(), checkpoint_id=os.path.join(path, 'optim'))
-                torch.distributed.checkpoint.state_dict_saver.save(
-                    self.optimizer.state_dict(), checkpoint_id=os.path.join(path, 'optim'))
-            except Exception as e:
-                print('failed to save optimizer state on rank {}\n{}'.format(
-                    self.rank, e))
+        state_dict = {"app": AppState(self.fsdp_model, self.optimizer)}
+        dcp.save(state_dict, checkpoint_id=path)
 
     def validate(self, val_dataloader):
         torch.cuda.empty_cache()
@@ -365,12 +334,10 @@ class Trainer:
                         if self.save_dir is not None:
                             if len(self.top_k_list) == self.save_top_k and self.top_k_list[-1]['loss'] < val_loss:
                                 # no need to save
-                                print('{} do not save'.format(self.rank))
                                 pass
                             else:
                                 save_path = os.path.join(
                                     self.save_dir, '{}_{}_{:.2f}'.format(epoch, self.step_cnt, val_loss))
-
                                 if len(self.top_k_list) > 0:
                                     ckpt_path_to_remove = self.top_k_list[-1]['path']
                                     if len(self.top_k_list) == self.save_top_k:
@@ -456,7 +423,6 @@ def main(**kwargs):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--save_frequency', default=1000, type=int)
-    parser.add_argument('--validate_frequency', default=None, type=int)
     parser.add_argument('--save_top_k', default=5, type=int)
     parser.add_argument('--clip_grad_max_norm', default=1, type=float)
     parser.add_argument('--save_dir', default=None, type=str)
@@ -469,7 +435,6 @@ if __name__ == "__main__":
 
     main(
         save_frequency=args.save_frequency,
-        validate_frequency=args.validate_frequency,
         save_dir=args.save_dir,
         log_dir=args.log_dir,
         save_top_k=args.save_top_k,
