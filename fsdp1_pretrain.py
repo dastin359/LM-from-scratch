@@ -1,23 +1,18 @@
-# Author: Yuanjun "Dastin" Huang
+# Author: Dastin (Yuanjun) Huang
 # FSDP1 pretraining for qwen2.5_0.5B on fineweb-edu
-# Last updated on 03/28/2025 (MM/DD/YYYY)
+# Last updated on 07/06/2025 (MM/DD/YYYY)
 
 from torchdata.stateful_dataloader.stateful_dataloader import StatefulDataLoader
 import torch.distributed.checkpoint as dcp
 import torch.distributed as dist
-import torch.distributed
 import torch.optim as optim
 from datasets import load_dataset
-import torch.utils
-import torch.utils.checkpoint
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoConfig
 from copy import deepcopy
 from tqdm import tqdm
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
-# from LARC import LARC
 import numpy as np
 from torcheval.metrics.functional.text import perplexity
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
@@ -33,9 +28,7 @@ import shutil
 import math
 import datetime
 from app_state import AppState
-# from dcp_util import AppState
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-# from bitsandbytes.optim import LARS
 
 DEBUG_STREAMING = False
 HF_DATA_FIELD = "text"
@@ -84,10 +77,9 @@ class CollateFn:
         return x, y
 
 
-def is_sharded_fsdp_ckpt(path):
+def is_eligible_ckpt(path):
     try:
         assert os.path.exists(path)
-
         assert os.path.exists(os.path.join(path, '.metadata'))
         for i in range(int(os.environ["WORLD_SIZE"])):
             assert os.path.exists(os.path.join(
@@ -144,7 +136,7 @@ class Trainer:
 
         self._init_model_and_optimizer()
         if load_from_ckpt is not None:
-            if is_sharded_fsdp_ckpt(load_from_ckpt):
+            if is_eligible_ckpt(load_from_ckpt):
                 state_dict = {"app": AppState(self.fsdp_model, self.optimizer)}
                 dcp.load(
                     state_dict=state_dict,
@@ -162,7 +154,7 @@ class Trainer:
                     dirs_with_steps, reverse=True, key=lambda x: x[1])
                 for dir, step in dirs_with_steps:
                     full_dir = os.path.join(load_from_ckpt, dir)
-                    if is_sharded_fsdp_ckpt(full_dir):
+                    if is_eligible_ckpt(full_dir):
                         try:
                             state_dict = {"app": AppState(
                                 self.fsdp_model, self.optimizer)}
@@ -219,11 +211,6 @@ class Trainer:
         self.fsdp_model.train()
 
     def save_checkpoint(self, path):
-        # waits for checkpointing to finish if one exists, avoiding queuing more then one checkpoint request at a time
-        # if self.model_state_ckpt_future is not None:
-        #     self.model_state_ckpt_future.result()
-        # if self.optim_state_ckpt_future is not None:
-        #     self.optim_state_ckpt_future.result()
         dist.barrier()
         state_dict = {"app": AppState(self.fsdp_model, self.optimizer)}
         dcp.save(state_dict, checkpoint_id=path)
@@ -373,8 +360,6 @@ class Trainer:
 
     def train(self):
         max_len_steps = [0, 256, 512, 768, 1024, 1536, 2048, 8192]
-        # batch_size_steps = [84, 42, 28, 21, 14, 11, 2]
-        # grad_acc_steps = [1, 2, 3, 4, 6, 8, 42]
         batch_size_steps = [63, 31, 21, 16, 11, 9, 2]
         grad_acc_steps = [1, 2, 3, 4, 6, 7, 32]
         collate_fn_generator = CollateFn(TOKENIZER_NAME)

@@ -1,6 +1,6 @@
-# Author: Yuanjun "Dastin" Huang
+# Author: Dastin (Yuanjun) Huang
 # DDP pretraining for qwen2.5_0.5B on fineweb-edu
-# Last updated on 03/17/2025 (MM/DD/YYYY)
+# Last updated on 07/06/2025 (MM/DD/YYYY)
 
 from torchdata.stateful_dataloader.stateful_dataloader import StatefulDataLoader
 import torch.distributed as dist
@@ -16,7 +16,6 @@ from copy import deepcopy
 from tqdm import tqdm
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
-# from LARC import LARC
 import numpy as np
 from torcheval.metrics.functional.text import perplexity
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
@@ -25,9 +24,9 @@ import argparse
 import torch
 import os
 import shutil
+import math
 import contextlib
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-# from bitsandbytes.optim import LARS
 
 DEBUG_STREAMING = False
 HF_DATA_FIELD = "text"
@@ -76,6 +75,11 @@ class CollateFn:
         return x, y
 
 
+def is_ckpt(path):
+    return os.path.exists(path) and os.path.exists(os.path.join(
+        path, 'model.pt')) and os.path.exists(os.path.join(path, 'optim.pt'))
+
+
 class Trainer:
     def __init__(self, save_frequency=1000, clip_grad_max_norm=1, save_dir=None, log_dir='', save_top_k=2, previous_ckpt_step=0, load_from_ckpt=None):
         self.save_frequency = save_frequency
@@ -91,7 +95,8 @@ class Trainer:
         self.save_dir = save_dir
 
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        dist.init_process_group("cpu:gloo,cuda:nccl")
+        # dist.init_process_group("cpu:gloo,cuda:nccl")
+        dist.init_process_group("cuda:nccl")
         self.rank = dist.get_rank()
         if self.rank != 0:
             from datasets.utils.logging import disable_progress_bar
@@ -101,15 +106,12 @@ class Trainer:
             HF_DATA_PATH,
             name=HF_DATA_SUBSET_NAME,
             split=HF_DATA_SPLIT+'[:98%]',
-            # split=HF_DATA_SPLIT,
             streaming=DEBUG_STREAMING,
         )
         self.val_dataset = load_dataset(
             HF_DATA_PATH,
             name=HF_DATA_SUBSET_NAME,
-            # split=HF_DATA_SPLIT+'[-2%:]',
-            split=HF_DATA_SPLIT+'[-5000:]',
-            # split=HF_DATA_SPLIT,
+            split=HF_DATA_SPLIT+'[-2%:]',
             streaming=DEBUG_STREAMING,
         )
 
@@ -119,16 +121,51 @@ class Trainer:
             log_dir = 'runs/{}'.format(log_dir)
             self.writer = SummaryWriter(log_dir=log_dir)
 
-        self._init_model_and_optimizer(load_from_ckpt)
+        self._init_model_and_optimizer()
+
+        if load_from_ckpt is not None and self.rank == 0:
+            if is_ckpt(load_from_ckpt):
+                self.ddp_model.load_state_dict(torch.load(
+                    os.path.join(load_from_ckpt, 'model.pt'), weights_only=True))
+                self.optimizer.load_state_dict(torch.load(
+                    os.path.join(load_from_ckpt, 'optim.pt'), weights_only=True))
+            else:
+                # find checkpoint
+                loaded_ckpt_flag = False
+                dirs = os.listdir(load_from_ckpt)
+                steps = [int(x.split('_')[-2]) for x in dirs]
+                dirs_with_steps = list(zip(dirs, steps))
+                dirs_with_steps = sorted(
+                    dirs_with_steps, reverse=True, key=lambda x: x[1])
+                for dir, step in dirs_with_steps:
+                    full_dir = os.path.join(load_from_ckpt, dir)
+                    if is_ckpt(full_dir):
+                        try:
+                            self.ddp_model.load_state_dict(torch.load(
+                                os.path.join(load_from_ckpt, 'model.pt'), weights_only=True))
+                            self.optimizer.load_state_dict(torch.load(
+                                os.path.join(load_from_ckpt, 'optim.pt'), weights_only=True))
+                            loaded_ckpt_flag = True
+                            if self.rank == 0:
+                                print('loaded checkpoint from {}'.format(full_dir))
+                            self.previous_ckpt_step = int(
+                                full_dir.split('_')[-2])
+                            break
+                        except:
+                            continue
+                if not loaded_ckpt_flag:
+                    self.previous_ckpt_step = 0
+        else:
+            self.previous_ckpt_step = 0
 
         self.lr_scheduler = LambdaLR(
             self.optimizer, lr_scheduler_fn)
-        self.lr_scheduler.last_epoch = previous_ckpt_step
+        self.lr_scheduler.last_epoch = self.previous_ckpt_step
 
         self.model_state_ckpt_future = None
         self.optim_state_ckpt_future = None
 
-    def _init_model_and_optimizer(self, load_from_ckpt):
+    def _init_model_and_optimizer(self):
         config = AutoConfig.from_pretrained(MODEL_NAME)
         config.vocab_size = 50258
         config.bos_token_id = 50256
@@ -142,17 +179,6 @@ class Trainer:
         self.ddp_model = DDP(model, device_ids=[self.rank])
         self.optimizer = optim.AdamW(self.ddp_model.parameters(),
                                      lr=MAX_LR, weight_decay=0.1)
-
-        if load_from_ckpt is not None and self.rank == 0:
-            # torch.distributed.checkpoint.state_dict_loader.load(self.ddp_model.state_dict(
-            # ), checkpoint_id=os.path.join(load_from_ckpt, 'model'))
-            # torch.distributed.checkpoint.state_dict_loader.load(self.optimizer.state_dict(
-            # ), checkpoint_id=os.path.join(load_from_ckpt, 'optim'))
-            self.ddp_model.load_state_dict(torch.load(
-                os.path.join(load_from_ckpt, 'model.pt'), weights_only=True))
-            self.optimizer.load_state_dict(torch.load(
-                os.path.join(load_from_ckpt, 'optim.pt'), weights_only=True))
-
         self.ddp_model.train()
 
     def save_checkpoint(self, path):
@@ -171,8 +197,7 @@ class Trainer:
             except Exception as e:
                 print('failed to save optimizer state on rank {}\n{}'.format(
                     self.rank, e))
-        # using barrier could cause DDP hang
-        # dist.barrier()
+        dist.barrier()
 
     def validate(self, val_dataloader):
         torch.cuda.empty_cache()
@@ -195,7 +220,7 @@ class Trainer:
                                       [:, :-1, :], y[:, 1:], ignore_index=-100)
                 batch_cnt += 1
 
-        # dist.barrier()
+        dist.barrier()
         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_ppl, op=dist.ReduceOp.SUM)
         dist.all_reduce(batch_cnt, op=dist.ReduceOp.SUM)
@@ -246,24 +271,22 @@ class Trainer:
                     mini_batch_ppl /= grad_accu_step
                     param_norm = torch.nn.utils.get_total_norm(
                         self.ddp_model.parameters())
-                    grad_norm_pre_optimization = torch.nn.utils.clip_grad_norm_(
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.ddp_model.parameters(), self.clip_grad_max_norm)
 
+                    dist.barrier()
                     dist.reduce(mini_batch_loss, 0, op=dist.ReduceOp.AVG)
                     dist.reduce(mini_batch_ppl, 0, op=dist.ReduceOp.AVG)
 
                     self.lr_scheduler.step()
                     self.optimizer.step()
-                    grad_norm_post_optimization = torch.nn.utils.get_total_norm(
-                        [x.grad for x in self.ddp_model.parameters()])
 
                     self.step_cnt += 1
                     if self.rank == 0:
                         self.writer.add_scalars(
-                            'grad_norm', {
+                            'norm', {
                                 'param': param_norm,
-                                'pre_opt_step': grad_norm_pre_optimization,
-                                'post_opt_step': grad_norm_post_optimization
+                                'grad': grad_norm,
                             },
                             self.step_cnt)
                         self.writer.add_scalars(
@@ -283,9 +306,7 @@ class Trainer:
                         pbar.set_postfix(postfix)
 
                     if self.step_cnt % self.save_frequency == 0:
-                        val_loss = 0
                         val_loss, val_ppl = self.validate(self.val_dataloader)
-
                         if self.save_dir is not None:
                             if len(self.top_k_list) == self.save_top_k and self.top_k_list[-1]['loss'] < val_loss:
                                 # no need to save
@@ -293,10 +314,10 @@ class Trainer:
                             else:
                                 save_path = os.path.join(
                                     self.save_dir, '{}_{}_{:.2f}'.format(epoch, self.step_cnt, val_loss))
-                                if self.rank == 0:
-                                    if len(self.top_k_list) > 0:
-                                        ckpt_path_to_remove = self.top_k_list[-1]['path']
-                                        if len(self.top_k_list) == self.save_top_k:
+                                if len(self.top_k_list) > 0:
+                                    ckpt_path_to_remove = self.top_k_list[-1]['path']
+                                    if len(self.top_k_list) == self.save_top_k:
+                                        if self.rank == 0:
                                             if os.path.isfile(ckpt_path_to_remove):
                                                 os.remove(ckpt_path_to_remove)
                                             elif os.path.isdir(ckpt_path_to_remove):
@@ -304,15 +325,16 @@ class Trainer:
                                                     ckpt_path_to_remove)
                                             else:
                                                 pass
-                                            self.top_k_list.pop(-1)
+                                        self.top_k_list.pop(-1)
 
-                                    self.top_k_list.append({
-                                        'path': save_path,
-                                        'loss': loss,
-                                    })
-                                    self.top_k_list = sorted(
-                                        self.top_k_list, key=lambda x: x['loss'])
+                                self.top_k_list.append({
+                                    'path': save_path,
+                                    'loss': val_loss,
+                                })
+                                self.top_k_list = sorted(
+                                    self.top_k_list, key=lambda x: x['loss'])
                                 self.save_checkpoint(save_path)
+
                                 if self.rank == 0:
                                     print('model saved to {}'.format(save_path))
 
@@ -330,6 +352,7 @@ class Trainer:
         batch_size_steps = [56, 28, 19, 14, 9, 7, 1]
         grad_acc_steps = [2, 4, 6, 8, 12, 16, 112]
         collate_fn_generator = CollateFn(TOKENIZER_NAME)
+        total_steps_cnt_after_this_dataloader = 0
 
         for low, high, batch_size, grad_acc_step in zip(max_len_steps[:-1], max_len_steps[1:], batch_size_steps, grad_acc_steps):
             if self.rank == 0:
@@ -337,11 +360,11 @@ class Trainer:
                     high, batch_size, grad_acc_step))
 
             current_train_dataset = self.train_dataset.filter(
-                lambda x: low < x['token_count'] < high
+                lambda x: low < x['token_count'] <= high
             )
 
             current_val_dataset = self.val_dataset.filter(
-                lambda x: low < x['token_count'] < high
+                lambda x: low < x['token_count'] <= high
             )
 
             collate_fn_generator.max_length = high
@@ -352,8 +375,15 @@ class Trainer:
             val_sampler = DistributedSampler(current_val_dataset)
             self.val_dataloader = StatefulDataLoader(current_val_dataset, shuffle=False,
                                                      sampler=val_sampler, collate_fn=collate_fn, batch_size=batch_size, num_workers=2)
-            self.train_on_dataloader(
-                train_sampler, grad_acc_step)
+            steps_in_current_train_loader = math.ceil(
+                len(self.train_dataloader) / grad_acc_step)
+            total_steps_cnt_after_this_dataloader += steps_in_current_train_loader
+            if self.previous_ckpt_step > total_steps_cnt_after_this_dataloader:
+                self.step_cnt += steps_in_current_train_loader
+                continue
+            else:
+                self.train_on_dataloader(
+                    train_sampler, grad_acc_step)
 
         dist.destroy_process_group()
 

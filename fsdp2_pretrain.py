@@ -1,23 +1,18 @@
-# Author: Yuanjun "Dastin" Huang
+# Author: Dastin (Yuanjun) Huang
 # FSDP2 pretraining for qwen2.5_0.5B on fineweb-edu
-# Last updated on 03/17/2025 (MM/DD/YYYY)
+# Last updated on 07/06/2025 (MM/DD/YYYY)
 
 from torchdata.stateful_dataloader.stateful_dataloader import StatefulDataLoader
-import torch.distributed.checkpoint as dcp
 import torch.distributed as dist
 import torch.distributed
 import torch.optim as optim
 from datasets import load_dataset
-import torch.utils
-import torch.utils.checkpoint
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoConfig
 from copy import deepcopy
 from tqdm import tqdm
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
-# from LARC import LARC
 import numpy as np
 from torcheval.metrics.functional.text import perplexity
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
@@ -32,10 +27,8 @@ import shutil
 import math
 import datetime
 
-# from dcp_util import AppState
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
-# from bitsandbytes.optim import LARS
 
 DEBUG_STREAMING = False
 HF_DATA_FIELD = "text"
@@ -48,8 +41,6 @@ MAX_LR = 5e-4
 MIN_LR = 5e-5
 WARMUP_STEP = 2000
 MAX_STEP = 100000
-# number of token in a batch per GPU assuming a 4-GPU setup
-MAX_BATCH_TOKEN_CNT = 500000 // 4
 
 
 def lr_scheduler_fn(x):
@@ -86,14 +77,33 @@ class CollateFn:
         return x, y
 
 
+def is_eligible_ckpt(path):
+    try:
+        assert os.path.exists(path) and os.path.exists(os.path.join(
+            path, 'model')) and os.path.exists(os.path.join(path, 'optim'))
+        assert os.path.exists(os.path.join(path, 'model', '.metadata')) and os.path.exists(
+            os.path.join(path, 'optim', '.metadata'))
+        for i in range(int(os.environ["WORLD_SIZE"])):
+            assert os.path.exists(os.path.join(
+                path, 'model', '__{}_0.distcp'.format(str(i))))
+            assert os.path.exists(os.path.join(
+                path, 'optim', '__{}_0.distcp'.format(str(i))))
+        return True
+    except:
+        return False
+
+
 class Trainer:
-    def __init__(self, save_frequency=1000, clip_grad_max_norm=1, save_dir=None, log_dir='', save_top_k=2, previous_ckpt_step=0, load_from_ckpt=None):
+    def __init__(self, save_frequency=1000, validate_frequency=None, clip_grad_max_norm=1, save_dir=None, log_dir='', save_top_k=2, load_from_ckpt=None):
         self.save_frequency = save_frequency
+        if validate_frequency is None:
+            self.validate_frequency = save_frequency
+        else:
+            self.validate_frequency = validate_frequency
         self.clip_grad_max_norm = clip_grad_max_norm
         self.save_top_k = save_top_k
         self.step_cnt = 0
         self.top_k_list = []
-        self.previous_ckpt_step = previous_ckpt_step
 
         if save_dir is not None:
             save_dir = 'model_checkpoints/{}'.format(save_dir)
@@ -102,8 +112,9 @@ class Trainer:
 
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         dist.init_process_group(
-            "cpu:gloo,cuda:nccl",
-            # timeout=datetime.timedelta(seconds=5400)
+            # "cpu:gloo,cuda:nccl",
+            "nccl",
+            timeout=datetime.timedelta(seconds=300)
         )
         self.rank = dist.get_rank()
         if self.rank != 0:
@@ -114,15 +125,12 @@ class Trainer:
             HF_DATA_PATH,
             name=HF_DATA_SUBSET_NAME,
             split=HF_DATA_SPLIT+'[:98%]',
-            # split=HF_DATA_SPLIT,
             streaming=DEBUG_STREAMING,
         )
         self.val_dataset = load_dataset(
             HF_DATA_PATH,
             name=HF_DATA_SUBSET_NAME,
             split=HF_DATA_SPLIT+'[-2%:]',
-            # split=HF_DATA_SPLIT+'[-5000:]',
-            # split=HF_DATA_SPLIT,
             streaming=DEBUG_STREAMING,
         )
 
@@ -133,14 +141,42 @@ class Trainer:
             self.writer = SummaryWriter(log_dir=log_dir)
 
         self._init_model_and_optimizer()
+
         if load_from_ckpt is not None:
-            torch.distributed.checkpoint.state_dict_loader.load(self.fsdp_model.state_dict(
-            ), checkpoint_id=os.path.join(load_from_ckpt, 'model'))
-            torch.distributed.checkpoint.state_dict_loader.load(self.optimizer.state_dict(
-            ), checkpoint_id=os.path.join(load_from_ckpt, 'optim'))
+            if is_eligible_ckpt(load_from_ckpt):
+                torch.distributed.checkpoint.state_dict_loader.load(self.fsdp_model.state_dict(
+                ), checkpoint_id=os.path.join(load_from_ckpt, 'model'))
+                torch.distributed.checkpoint.state_dict_loader.load(self.optimizer.state_dict(
+                ), checkpoint_id=os.path.join(load_from_ckpt, 'optim'))
+            else:
+                # find checkpoint
+                loaded_ckpt_flag = False
+                dirs = os.listdir(load_from_ckpt)
+                dirs = sorted(dirs, reverse=True)
+                for dir in dirs:
+                    full_dir = os.path.join(load_from_ckpt, dir)
+                    if is_eligible_ckpt(full_dir):
+                        try:
+                            torch.distributed.checkpoint.state_dict_loader.load(self.fsdp_model.state_dict(
+                            ), checkpoint_id=os.path.join(full_dir, 'model'))
+                            torch.distributed.checkpoint.state_dict_loader.load(self.optimizer.state_dict(
+                            ), checkpoint_id=os.path.join(full_dir, 'optim'))
+                            loaded_ckpt_flag = True
+                            if self.rank == 0:
+                                print('loaded checkpoint from {}'.format(full_dir))
+                            self.previous_ckpt_step = int(
+                                full_dir.split('_')[-2])
+                            break
+                        except:
+                            continue
+                if not loaded_ckpt_flag:
+                    self.previous_ckpt_step = 0
+        else:
+            self.previous_ckpt_step = 0
+
         self.lr_scheduler = LambdaLR(
             self.optimizer, lr_scheduler_fn)
-        self.lr_scheduler.last_epoch = previous_ckpt_step
+        self.lr_scheduler.last_epoch = self.previous_ckpt_step
 
         self.model_state_ckpt_future = None
         self.optim_state_ckpt_future = None
@@ -171,32 +207,11 @@ class Trainer:
         self.fsdp_model.train()
 
     def save_checkpoint(self, path):
-        # waits for checkpointing to finish if one exists, avoiding queuing more then one checkpoint request at a time
-        # if self.model_state_ckpt_future is not None:
-        #     self.model_state_ckpt_future.result()
-        # if self.optim_state_ckpt_future is not None:
-        #     self.optim_state_ckpt_future.result()
         dist.barrier()
-        try:
-            # torch.cuda.empty_cache()
-            # self.model_state_ckpt_future = torch.distributed.checkpoint.state_dict_saver.async_save(
-            #     self.fsdp_model.state_dict(), checkpoint_id=os.path.join(path, 'model'))
-            torch.distributed.checkpoint.state_dict_saver.save(
-                self.fsdp_model.state_dict(), checkpoint_id=os.path.join(path, 'model'))
-        except Exception as e:
-            print('failed to save model state on rank {}\n{}'.format(self.rank, e))
-        dist.barrier()
-        try:
-            # torch.cuda.empty_cache()
-            # self.optim_state_ckpt_future = torch.distributed.checkpoint.state_dict_saver.async_save(
-            #     self.optimizer.state_dict(), checkpoint_id=os.path.join(path, 'optim'))
-            torch.distributed.checkpoint.state_dict_saver.save(
-                self.optimizer.state_dict(), checkpoint_id=os.path.join(path, 'optim'))
-        except Exception as e:
-            print('failed to save optimizer state on rank {}\n{}'.format(self.rank, e))
-        # torch.distributed.checkpoint.state_dict_saver.save(
-        #     self.train_dataloader.state_dict(), checkpoint_id=os.path.join(path, 'dataloader'))
-        # torch.cuda.empty_cache()
+        torch.distributed.checkpoint.state_dict_saver.save(
+            self.fsdp_model.state_dict(), checkpoint_id=os.path.join(path, 'model'))
+        torch.distributed.checkpoint.state_dict_saver.save(
+            self.optimizer.state_dict(), checkpoint_id=os.path.join(path, 'optim'))
 
     def validate(self, val_dataloader):
         torch.cuda.empty_cache()
@@ -265,7 +280,7 @@ class Trainer:
                     mini_batch_ppl /= grad_accu_step
                     param_norm = torch.nn.utils.get_total_norm(
                         self.fsdp_model.parameters())
-                    grad_norm_pre_optimization = torch.nn.utils.clip_grad_norm_(
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.fsdp_model.parameters(), self.clip_grad_max_norm)
 
                     dist.barrier()
@@ -274,16 +289,13 @@ class Trainer:
 
                     self.lr_scheduler.step()
                     self.optimizer.step()
-                    grad_norm_post_optimization = torch.nn.utils.get_total_norm(
-                        [x.grad for x in self.fsdp_model.parameters()])
 
                     self.step_cnt += 1
                     if self.rank == 0:
                         self.writer.add_scalars(
-                            'grad_norm', {
+                            'norm', {
                                 'param': param_norm.to_local(),
-                                'pre_opt_step': grad_norm_pre_optimization.to_local(),
-                                'post_opt_step': grad_norm_post_optimization.to_local()
+                                'grad': grad_norm.to_local(),
                             },
                             self.step_cnt)
                         self.writer.add_scalars(
@@ -303,20 +315,25 @@ class Trainer:
                         pbar.set_postfix(postfix)
 
                     if self.step_cnt % self.save_frequency == 0:
-                        val_loss = 0
-                        val_loss, val_ppl = self.validate(self.val_dataloader)
+                        val_loss, val_ppl = self.validate(
+                            self.val_dataloader)
+                        if self.rank == 0:
+                            self.writer.add_scalars(
+                                'perplexity', {'val': val_ppl}, self.step_cnt)
+                            self.writer.add_scalars(
+                                'loss', {'val': val_loss}, self.step_cnt)
 
                         if self.save_dir is not None:
-                            if len(self.top_k_list) == self.save_top_k and self.top_k_list[-1]['loss'] < val_loss:
+                            if len(self.top_k_list) == self.save_top_k and val_loss is not None and self.top_k_list[-1]['loss'] < val_loss:
                                 # no need to save
                                 pass
                             else:
                                 save_path = os.path.join(
                                     self.save_dir, '{}_{}_{:.2f}'.format(epoch, self.step_cnt, val_loss))
-                                if self.rank == 0:
-                                    if len(self.top_k_list) > 0:
-                                        ckpt_path_to_remove = self.top_k_list[-1]['path']
-                                        if len(self.top_k_list) == self.save_top_k:
+                                if len(self.top_k_list) > 0:
+                                    ckpt_path_to_remove = self.top_k_list[-1]['path']
+                                    if len(self.top_k_list) == self.save_top_k:
+                                        if self.rank == 0:
                                             if os.path.isfile(ckpt_path_to_remove):
                                                 os.remove(ckpt_path_to_remove)
                                             elif os.path.isdir(ckpt_path_to_remove):
@@ -324,23 +341,18 @@ class Trainer:
                                                     ckpt_path_to_remove)
                                             else:
                                                 pass
-                                            self.top_k_list.pop(-1)
+                                        self.top_k_list.pop(-1)
 
-                                    self.top_k_list.append({
-                                        'path': save_path,
-                                        'loss': loss,
-                                    })
-                                    self.top_k_list = sorted(
-                                        self.top_k_list, key=lambda x: x['loss'])
+                                self.top_k_list.append({
+                                    'path': save_path,
+                                    'loss': loss,
+                                })
+                                self.top_k_list = sorted(
+                                    self.top_k_list, key=lambda x: x['loss'])
                                 self.save_checkpoint(save_path)
+
                                 if self.rank == 0:
                                     print('model saved to {}'.format(save_path))
-
-                        if self.rank == 0:
-                            self.writer.add_scalars(
-                                'perplexity', {'val': val_ppl}, self.step_cnt)
-                            self.writer.add_scalars(
-                                'loss', {'val': val_loss}, self.step_cnt)
 
                     if self.rank == 0:
                         pbar.update(1)
@@ -358,11 +370,11 @@ class Trainer:
                     high, batch_size, grad_acc_step))
 
             current_train_dataset = self.train_dataset.filter(
-                lambda x: low < x['token_count'] < high
+                lambda x: low < x['token_count'] <= high
             )
 
             current_val_dataset = self.val_dataset.filter(
-                lambda x: low < x['token_count'] < high
+                lambda x: low < x['token_count'] <= high
             )
 
             collate_fn_generator.max_length = high
@@ -395,12 +407,12 @@ def main(**kwargs):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--save_frequency', default=1000, type=int)
+    parser.add_argument('--validate_frequency', default=None, type=int)
     parser.add_argument('--save_top_k', default=5, type=int)
     parser.add_argument('--clip_grad_max_norm', default=1, type=float)
     parser.add_argument('--save_dir', default=None, type=str)
     parser.add_argument('--log_dir', default='test', type=str)
     parser.add_argument('--seed', default=163, type=int)
-    parser.add_argument('--previous_ckpt_step', default=0, type=int)
     parser.add_argument('--load_from_ckpt', default=None, type=str)
 
     args = parser.parse_args()
@@ -408,10 +420,10 @@ if __name__ == "__main__":
 
     main(
         save_frequency=args.save_frequency,
+        validate_frequency=args.validate_frequency,
         save_dir=args.save_dir,
         log_dir=args.log_dir,
         save_top_k=args.save_top_k,
         clip_grad_max_norm=args.clip_grad_max_norm,
-        previous_ckpt_step=args.previous_ckpt_step,
         load_from_ckpt=args.load_from_ckpt,
     )

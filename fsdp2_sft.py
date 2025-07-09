@@ -1,6 +1,6 @@
-# Author: Yuanjun "Dastin" Huang
+# Author: Dastin (Yuanjun) Huang
 # FSDP2 SFT for qwen2.5_0.5B on open-thoughts/OpenThoughts-114k
-# Last updated on 04/11/2025 (MM/DD/YYYY)
+# Last updated on 07/06/2025 (MM/DD/YYYY)
 
 from torchdata.stateful_dataloader.stateful_dataloader import StatefulDataLoader
 import torch.distributed.checkpoint as dcp
@@ -8,13 +8,11 @@ import torch.distributed as dist
 import torch.optim as optim
 from datasets import load_dataset, load_from_disk
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoConfig
 from copy import deepcopy
 from tqdm import tqdm
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
-# from LARC import LARC
 import numpy as np
 from torcheval.metrics.functional.text import perplexity
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
@@ -30,11 +28,13 @@ import math
 import datetime
 from app_state import AppState
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-# from bitsandbytes.optim import LARS
+
 
 DEBUG_STREAMING = False
 HF_DATA_FIELD = "text"
 # HF_DATA_PATH = 'open-thoughts/OpenThoughts-114k'
+# You need to download 'open-thoughts/OpenThoughts-114k' and split it into train and val sets
+# You can also use your own dataset, just make sure it has the same structure
 HF_TRAIN_DATA_PATH = 'dataset/sft_train'
 HF_VAL_DATA_PATH = 'dataset/sft_val'
 
@@ -81,10 +81,6 @@ class CollateFn:
 
     def _apply_chat_template(self, x):
         conversations = x['conversations']
-        # for c in conversations:
-        #     c['role'] = c.pop('from')
-        #     c['content'] = c.pop('value')
-
         messages = [
             {"role": "system", "content": x['system']},
         ] + conversations
@@ -171,10 +167,6 @@ class Trainer:
                 )
                 self.previous_ckpt_step = int(
                     load_from_ckpt.split('_')[-2])
-                # torch.distributed.checkpoint.state_dict_loader.load(self.fsdp_model.state_dict(
-                # ), checkpoint_id=os.path.join(load_from_ckpt, 'model'))
-                # torch.distributed.checkpoint.state_dict_loader.load(self.optimizer.state_dict(
-                # ), checkpoint_id=os.path.join(load_from_ckpt, 'optim'))
             else:
                 # find checkpoint
                 loaded_ckpt_flag = False
@@ -251,11 +243,6 @@ class Trainer:
         self.fsdp_model.train()
 
     def save_checkpoint(self, path):
-        # waits for checkpointing to finish if one exists, avoiding queuing more then one checkpoint request at a time
-        # if self.model_state_ckpt_future is not None:
-        #     self.model_state_ckpt_future.result()
-        # if self.optim_state_ckpt_future is not None:
-        #     self.optim_state_ckpt_future.result()
         dist.barrier()
         state_dict = {"app": AppState(self.fsdp_model, self.optimizer)}
         dcp.save(state_dict, checkpoint_id=path)
