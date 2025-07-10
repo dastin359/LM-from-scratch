@@ -1,6 +1,6 @@
 # Author: Dastin (Yuanjun) Huang
 # FSDP2 pretraining for qwen2.5_0.5B on fineweb-edu
-# Last updated on 07/06/2025 (MM/DD/YYYY)
+# Last updated on 07/10/2025 (MM/DD/YYYY)
 
 from torchdata.stateful_dataloader.stateful_dataloader import StatefulDataLoader
 import torch.distributed as dist
@@ -345,7 +345,7 @@ class Trainer:
 
                                 self.top_k_list.append({
                                     'path': save_path,
-                                    'loss': loss,
+                                    'loss': val_loss,
                                 })
                                 self.top_k_list = sorted(
                                     self.top_k_list, key=lambda x: x['loss'])

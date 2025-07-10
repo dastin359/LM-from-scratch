@@ -8,7 +8,7 @@ class AppState(Stateful):
     with the Stateful protocol, DCP will automatically call state_dict/load_stat_dict as needed in the
     dcp.save/load APIs.
 
-    Note: We take advantage of this wrapper to hande calling distributed state dict methods on the model
+    Note: We take advantage of this wrapper to handle calling distributed state dict methods on the model
     and optimizer.
     """
 
