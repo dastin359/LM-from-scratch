@@ -41,4 +41,4 @@ torchrun --nproc_per_node=4 fsdp2_sft.py \
 
 ## Read More
 
-For complete details—including project motivation, FSDP internals, token bucketing strategies, checkpoint formats, and distributed training insights—see project_details.md.
+For complete details—including project motivation, FSDP internals, token bucketing strategies, checkpoint formats, and distributed training insights—see [project_details.md](project_details.md).
