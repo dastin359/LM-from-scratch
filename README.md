@@ -30,6 +30,14 @@ git clone https://github.com/dastin359/LM-from-scratch.git
 cd LM-from-scratch
 pip install -r requirements.txt
 
+# Pretrain using DDP on 4 GPUs
+torchrun --nproc_per_node=4 ddp_pretrain.py \
+  --save_dir=my_run --log_dir=my_log
+
+# Pretrain using FSDP1 on 4 GPUs
+torchrun --nproc_per_node=4 fsdp1_pretrain.py \
+  --save_dir=my_run --log_dir=my_log
+
 # Pretrain using FSDP2 on 4 GPUs
 torchrun --nproc_per_node=4 fsdp2_pretrain.py \
   --save_dir=my_run --log_dir=my_log
@@ -41,4 +49,4 @@ torchrun --nproc_per_node=4 fsdp2_sft.py \
 
 ## Read More
 
-For complete details—including project motivation, FSDP internals, token bucketing strategies, checkpoint formats, and distributed training insights—see [project_details.md](project_details.md).
+For complete details—including project motivation, FSDP internals, token bucketing strategies, checkpoint formats, and distributed training insights—see [Technical Deep Dive](technical-deep-dive.md).
